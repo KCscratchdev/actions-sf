@@ -1,0 +1,165 @@
+parameters:
+  env: "defaultEnv"
+  tokenName: "defaultTokenName"
+  runTestClasses: "true"
+  destructiveChangesEnabled: "true"
+  excludeFields: ""
+  CHECK_DIFF: "True"
+  PACKAGE_XML_NAME: "manifest/package.xml"
+  
+jobs:
+- deployment: ValidateAndDeployment
+  displayName: Validate and deployment
+  pool:
+    vmImage: 'ubuntu-latest'
+  environment: ${{ parameters.env }}
+  strategy:
+    runOnce:
+      deploy:
+        steps:
+        - checkout: self
+          clean: true
+          fetchDepth: full
+        - task: NodeTool@0 
+          inputs:
+            versionSpec: '18.x'
+        - task: DownloadSecureFile@1
+          name: SalesforceToken
+          displayName: 'Download auth file for SF'
+          inputs:
+            secureFile: ${{ parameters.tokenName }}
+        - script: |
+            if [ ${{ parameters.env }} = "UAT" ] || [ ${{ parameters.env }} = "STAGING" ] || [ ${{ parameters.env }} = "PROD" ] || [ ${{ parameters.env }} = "FULLCOPY" ]; then
+              sourceBranch=$(echo "$BRANCH_NAME" | sed 's|refs/heads/||g')
+              echo "##vso[task.setvariable variable=sourceBranch;]$sourceBranch"
+              echo -e "\nDownloading latest build for Environment: ${{ parameters.env }} and BranchName: $sourceBranch"
+              #Prepare URL with Pipeline config and rewrite spaces with URL encoding
+              PIPELINE_URL_ADO=$( echo "$URL&\$top=1&api-version=7.1-preview.7" | sed 's/ /%20/g' )
+              curl -H "Authorization: Bearer $SYSTEM_ACCESSTOKEN" -X GET -L "$PIPELINE_URL_ADO" -o sourceVersionResponse.json
+              echo "$PIPELINE_URL_ADO"
+              cat sourceVersionResponse.json
+              if cat sourceVersionResponse.json | grep -o '"result":"[^"]*' | grep -o '[^"]*$' | grep -q succeeded; then
+                latestBuildCommit=$(cat sourceVersionResponse.json | grep -o '"sourceVersion":"[^"]*' | grep -o '[^"]*$')
+                echo -e "\nLast build succeeded, commit set to latest validated to environment: $latestBuildCommit"
+                echo "##vso[task.setvariable variable=latestBuildCommit]$latestBuildCommit"
+              else
+                latestBuildCommit=$(git rev-list --all --max-parents=0)
+                echo -e "\nLast build failed or error, commit set to initial one from branch $BRANCH_NAME and its $latestBuildCommit"
+                echo "##vso[task.setvariable variable=latestBuildCommit]$latestBuildCommit"
+              fi
+            fi
+             
+          displayName: "Set range of commits for environment"
+          env:
+              BRANCH_NAME: $(Build.SourceBranchName)
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+              #URL: $(System.TeamFoundationCollectionUri)$(System.TeamProject)/_apis/build/latest/$(Build.DefinitionName)
+              URL: $(System.TeamFoundationCollectionUri)$(System.TeamProject)/_apis/build/builds?definitions=$(System.DefinitionId)
+        - script: |
+            if ! command -v sf &> /dev/null
+              then
+                  echo "SF CLI Not found, installing..."
+                  npm install @salesforce/cli --global
+                  echo y | sf plugins install sfdx-git-delta
+              else
+                  echo "SF CLI installed."
+            fi
+          displayName: "Install SF CLI and SDG"
+        - script: |
+            sf org login sfdx-url --sfdx-url-file $(SalesforceToken.secureFilePath) --alias ${{ parameters.env }}
+          displayName: "Salesforce Login"
+
+        - script: |
+            echo "CHECK DIFF RESULT: ${{ parameters.CHECK_DIFF }}"
+            if [ ${{ parameters.CHECK_DIFF }} = "True" ]; then
+              echo "Skip rest of Metadata "
+              exit 0
+            fi
+            echo "Retrieve Metadata..."
+            sf project retrieve start -x ${{ parameters.PACKAGE_XML_NAME }} -o ${{ parameters.env }} -r ./retrieve_directory
+            diff_found=false
+            echo " ./retrieve_directory:"
+            find ./retrieve_directory -type f
+
+            echo " force-app:"
+            find ./force-app -type f
+            for file in $(find ./retrieve_directory -type f); do
+                force_app_file=${file/\/retrieve_directory\//\/force-app\/main\/default\/}
+                if [ -f "$force_app_file" ]; then
+                    diff_output=$(diff -w -B "$file" "$force_app_file")
+                    if [ $? -ne 0 ]; then
+                      echo "--------------------------------------------" >> diff_result.txt
+                      echo "DIFFERENCE BETWEEN $file AND $force_app_file:" >> diff_result.txt
+                      echo "$diff_output" >> diff_result.txt
+                      diff_found=true
+                  fi
+                fi
+            done
+            if [ "$diff_found" = true ]; then
+              exit 1
+            fi
+          name: RetrieveAndCompare
+          displayName: "Retrieve and compare metadata"
+        
+        - task: PublishPipelineArtifact@1
+          inputs:
+            path: diff_result.txt
+            artifact: DiffResult
+          condition: failed()
+
+        - script: |
+            echo "Prepare delta for validation for ${{ parameters.env }}"
+            if [ ${{ parameters.env }} = "UAT" ] || [ ${{ parameters.env }} = "STAGING" ] || [ ${{ parameters.env }} = "PROD" ] || [ ${{ parameters.env }} = "PWCNETWZERO" ] || [ ${{ parameters.env }} = "FULLCOPY" ]; then
+              sf sgd source delta -a 60 --to HEAD --from $(latestBuildCommit) -o .
+            elif [ ${{ parameters.env }} = "DEVINT" ]; then
+              sf sgd source delta -a 60 --to HEAD --from origin/develop -o .
+            fi
+            mv package/package.xml manifest/package.xml
+            mv destructiveChanges/destructiveChanges.xml manifest/destructiveChanges.xml
+            echo "*********PACKAGE.XML******************"
+            cat manifest/package.xml
+            echo
+            echo "**************************************"
+            echo "*********DESTRUCTIVECHANGES.XML******************"
+            cat manifest/destructiveChanges.xml
+            echo "**************************************"
+          displayName: "Create a Manifest"
+        - script: |
+            EXFIELDS="${{ parameters.excludeFields }}"
+            echo "$EXFIELDS"
+            if [ ! -z "$EXFIELDS" ]; then
+              #REWRITE manifest
+              echo "$EXFIELDS" | tr ";" "\n" | while read FIELD; do
+                if echo "$FIELD" | grep -q "/"; then
+                  TYPE=$(echo "$FIELD" | cut -f 1 -d "/")
+                  MEMBER=$(echo "$FIELD" | cut -f 2 -d "/")
+                  echo "Proceed to delete type: $TYPE member: $MEMBER"
+                  xmlstarlet ed --inplace -N md=http://soap.sforce.com/2006/04/metadata -d "//md:types[md:name=\"$TYPE\"]/md:members[.=\"$MEMBER\"]" manifest/package.xml
+                else
+                  TYPE="$FIELD"
+                  echo "Proceed to delete whole type: $TYPE"
+                  xmlstarlet ed --inplace -N md=http://soap.sforce.com/2006/04/metadata -d "//md:types[md:name=\"$TYPE\"]" manifest/package.xml
+                fi
+              done
+              echo "---------------------------------------------------------"
+              echo "manifest/package.xml after rebuilding using excludeFields:"
+              echo "---------------------------------------------------------"
+              cat manifest/package.xml
+            fi
+          displayName: "Rewrite manifest with excluded fields"
+        - script: |
+            echo "Build parameters for SF call"
+            SF_ARGS=""
+            if [ ! -z ${{ parameters.runTestClasses }} ]; then
+              if [ ${{ parameters.runTestClasses }} = "true" ]; then
+                SF_ARGS+=" -l RunLocalTests --coverage-formatters "cobertura" --results-dir ./result-dir "
+              fi
+            fi
+            if [ ! -z ${{ parameters.destructiveChangesEnabled }} ]; then
+              if [ ${{ parameters.destructiveChangesEnabled }} = "true" ]; then
+                SF_ARGS+=" --post-destructive-changes manifest/destructiveChanges.xml "
+              fi
+            fi
+            echo "Additional args concatenated: ${SF_ARGS}"
+            sf project deploy start --dry-run -x manifest/package.xml ${SF_ARGS} -o ${{ parameters.env }} --verbose
+          displayName: "Validate code"
