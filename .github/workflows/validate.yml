@@ -34,6 +34,6 @@ jobs:
 
       - name: SFDX Auth
         env:
-          ACCESS_TOKEN: ${{ secrets.Token }}
+          SF_ACCESS_TOKEN: ${{ secrets.Token }}
         run: |
-          sf org login access-token $ACCESS_TOKEN 
+          sf org login access-token --instance-url https://pwccom56-dev-ed.develop.my.salesforce.com
