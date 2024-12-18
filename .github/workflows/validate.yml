@@ -34,4 +34,4 @@ jobs:
         env:
           ACCESS_TOKEN: ${{ secrets.Token }}
         run: |
-          npx sf org login ACCESS_TOKEN 
+          sf org login ACCESS_TOKEN 
