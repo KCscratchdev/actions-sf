@@ -37,4 +37,5 @@ jobs:
         env:
           ACCESS_TOKEN: ${{ secrets.Token }}
         run: |
-          sf org login sfdx-url --sfdx-url-file $ACCESS_TOKEN
+          jq --arg secret "$ACCESS_TOKEN" '.mySecret = $secret' config.json > tmp.json && mv tmp.json config.json
+          sf org login sfdx-url --sfdx-url-file config.json
