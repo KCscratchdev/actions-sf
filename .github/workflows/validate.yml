@@ -29,6 +29,8 @@ jobs:
       - name: Install Dependencies
         if: steps.npm_cache_id.outputs.cache-hit != 'true'
         run: npm install --force
+      - name: Install SF CLI
+        run: npm install @salesforce/cli --global
 
       - name: SFDX Auth
         env:
