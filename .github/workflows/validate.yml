@@ -28,7 +28,7 @@ jobs:
 
       - name: Install Dependencies
         if: steps.npm_cache_id.outputs.cache-hit != 'true'
-        run: npm install
+        run: npm install --force
 
       - name: SFDX Auth
         env:
